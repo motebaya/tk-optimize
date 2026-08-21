@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# pytest cache
+.pytest_cache/
+
+# Generated test fixtures (recreated by tests/conftest.py with ffmpeg)
+tests/fixtures/
+
+# Local artefacts
+*.log
+.DS_Store
+
+*.ps1
