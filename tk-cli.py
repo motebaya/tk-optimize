@@ -27,7 +27,6 @@ import os
 import re
 import sys
 
-import questionary
 from rich.console import Console, Group
 from rich.text import Text
 from rich.align import Align
@@ -60,6 +59,22 @@ from tk_optimize.ui import Logger, Message
 from tk_optimize.workflow import default_output_path
 
 METHOD_CHOICES = ("stealth", "shadow", "trace")
+_QUESTIONARY = None
+
+
+def _q():
+    """Lazily import questionary; only interactive paths ever need it."""
+    global _QUESTIONARY
+    if _QUESTIONARY is None:
+        try:
+            import questionary
+        except ImportError:
+            raise ConfigError(
+                "questionary is required for interactive prompts "
+                "(pip install questionary) or pass arguments non-interactively"
+            )
+        _QUESTIONARY = questionary
+    return _QUESTIONARY
 METHOD_HELP = {
     "stealth": "stream-copy lineage (video untouched, audio rebuild, fake-sample surgery)",
     "shadow": "encode-patch lineage (H.264 re-encode, remux, container patch)",
@@ -247,7 +262,7 @@ def _is_interactive():
 def _prompt_input_path():
     """Ask for the input path via questionary; returns None when not given."""
     try:
-        return questionary.text("Input video path:").ask()
+        return _q().text("Input video path:").ask()
     except (KeyboardInterrupt, EOFError):
         return None
 
@@ -262,11 +277,11 @@ def _choose_method(requested):
         )
         return "trace"
     choices = [
-        questionary.Choice(f"{name} — {METHOD_HELP[name]}", value=name)
+        _q().Choice(f"{name} — {METHOD_HELP[name]}", value=name)
         for name in METHOD_CHOICES
     ]
     try:
-        return questionary.select("Transformation method:", choices=choices).ask()
+        return _q().select("Transformation method:", choices=choices).ask()
     except (KeyboardInterrupt, EOFError):
         return None
 
@@ -274,7 +289,7 @@ def _choose_method(requested):
 def _confirm_answer():
     """Questionary-backed replacement for the plain ``input()`` confirm."""
     try:
-        answer = questionary.text("").ask()
+        answer = _q().text("").ask()
     except (KeyboardInterrupt, EOFError):
         return False
     if answer is None:
@@ -297,7 +312,7 @@ def _confirm_overwrite(output):
         return False
     try:
         return bool(
-            questionary.confirm(
+            _q().confirm(
                 f"Output already exists: {output}. Overwrite?"
             ).ask()
         )

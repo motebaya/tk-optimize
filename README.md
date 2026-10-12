@@ -342,11 +342,25 @@ pip install -r requirements.txt
 
 Run:
 
-    python3 tk-cli.py [INPUT.mp4] [--output-dir DIR] [--verbose] [--dry-run]
+    python3 tk-cli.py [INPUT.mp4] [--method NAME] [--output FILE]
+                      [--output-dir DIR] [--verbose] [--dry-run]
                       [--optimize-bitrate|--no-optimize-bitrate]
                       [--target-bitrate MBPS] [--crf N] [--preset NAME]
+                      [--audio-bitrate BPS] [--video-bitrate BPS] [--fps R]
 
 Without an input argument the source MP4 path is prompted for.
+
+### Transformation lineages (`--method`)
+
+| Method    | Lineage         | Pipeline                                              | FFmpeg requirement |
+| --------- | --------------- | ----------------------------------------------------- | ------------------ |
+| `stealth` | stream-copy     | audio rebuild + video stream copy + container surgery | Linux build 6.1.x  |
+| `shadow`  | encode-patch    | one H.264 encode + copy remux + container patch       | build 8.0          |
+| `trace`   | legacy workflow | codec-routed optimize/transform (default)             | any recent build   |
+
+`--method` defaults to an interactive selection; non-interactive runs fall
+back to `trace`.  `stealth` and `shadow` write their output to `--output`
+or `<output-dir>/<stem>-optimized.mp4` and confirm before overwriting.
 
 The output is written to the output directory (default `output/`, or
 `TK_OUTPUT_DIR` / `--output-dir`):
@@ -358,6 +372,12 @@ The output is written to the output directory (default `output/`, or
 
 | Flag                    | Meaning                                                    |
 | ----------------------- | ---------------------------------------------------------- |
+| `--version`             | print the CLI/package version and exit                     |
+| `--method NAME`         | lineage: `stealth`, `shadow`, or `trace` (default: prompt) |
+| `--output FILE`         | explicit output file for the stealth/shadow lineages       |
+| `--audio-bitrate BPS`   | audio bitrate for stealth/shadow (lineage-specific default)|
+| `--video-bitrate BPS`   | video bitrate for the shadow lineage                       |
+| `--fps R`               | frame-rate fraction for the shadow lineage (e.g. `990899/16517`) |
 | `--output-dir`          | output directory (default: `$TK_OUTPUT_DIR` or `output/`)  |
 | `--verbose`             | diagnostic output (metadata, FFmpeg versions, per-check)   |
 | `--dry-run`             | inspect and plan without writing any files                 |
