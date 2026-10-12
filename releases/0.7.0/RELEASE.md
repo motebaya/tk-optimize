@@ -32,7 +32,7 @@ for both lineages (covered by `tests/test_lineage_regression.py`).
 - `shadow` requires an FFmpeg 8.0 (`Lavf62.3.100`) build with libx264.
 - Set `TK_SHADOW_FFMPEG` / `TK_STEALTH_FFMPEG` to enable the
   byte-identity regression tests; without them the tests skip (a skip is
-  not a pass — see `release-gate.py`).
+  not a pass).
 
 ## Known limitations
 
@@ -42,8 +42,9 @@ for both lineages (covered by `tests/test_lineage_regression.py`).
 
 ## Release readiness
 
-Run `python release-gate.py` (optionally with the two toolchain env vars
-set). A green gate means: tests pass, branding policy holds on tracked
-files, versioning is consistent, and reproducible byte-identity checks
-pass wherever the required toolchain is present. Items that cannot run
-are reported as NOT VERIFIED, never as passed.
+Release readiness is checked before publication: test suite green, branding
+policy holds on tracked files, versioning is consistent, and the reproducible
+byte-identity checks pass wherever the required toolchain is present. Checks
+that cannot run on a given host are reported as NOT VERIFIED, never as passed.
+The maintainer-side gate script that automates this lives under `tools/`
+(gitignored) and is not part of the shipped tree.

@@ -198,6 +198,12 @@ class _CLISink:
             return
         if self.console.is_terminal:
             text = message.text
+            if text.startswith("stage:"):
+                self._start_status(text.partition(": ")[2] or text)
+                return
+            if text.startswith("stage done:"):
+                self._stop_status()
+                return
             for start in _LONG_OP_STARTS:
                 if text.startswith(start):
                     self._start_status(text)
@@ -340,7 +346,8 @@ def _run_lineage(method, path, args, config):
         os.makedirs(out_dir, exist_ok=True)
     if os.path.exists(output) and not _confirm_overwrite(output):
         return 1
-    logger = Logger(sink=console_sink)
+    sink = _CLISink(console)
+    logger = Logger(sink=sink)
     try:
         if method == "stealth":
             info = stealth_run(
@@ -348,6 +355,7 @@ def _run_lineage(method, path, args, config):
                 output,
                 audio_bitrate=args.audio_bitrate or STEALTH_DEFAULT_AUDIO_BITRATE,
                 log=logger,
+                verbose=args.verbose,
             )
         else:
             info = shadow_run(
@@ -357,6 +365,7 @@ def _run_lineage(method, path, args, config):
                 audio_bitrate=args.audio_bitrate or SHADOW_DEFAULT_AUDIO_BITRATE,
                 fps=args.fps or SHADOW_DEFAULT_FPS,
                 log=logger,
+                verbose=args.verbose,
             )
     except (MethodStreamError, MethodPatchError) as exc:
         _emit_error(str(exc))
@@ -364,6 +373,8 @@ def _run_lineage(method, path, args, config):
     except FFmpegNotFoundError as exc:
         _emit_error(str(exc))
         return 1
+    finally:
+        sink.close()
     _report_lineage(info, verbose=args.verbose)
     return 0
 

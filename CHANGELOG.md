@@ -24,11 +24,13 @@ this changelog; this file starts with 0.7.0.
   `--video-bitrate`, `--fps` for the lineage methods.
 - questionary-based interactive prompts (input path, method selection,
   overwrite confirmation); piped stdin remains supported for automation.
+- Stage progress feedback for the lineage methods: interactive terminals
+  show a live spinner per pipeline stage (elapsed time and output size on
+  completion); `--verbose` adds pure-Python diagnostics (FFmpeg argv,
+  container stats, patch counters) without dumping external command output.
 - Lineage byte-identity regression tests (`tests/test_lineage_regression.py`),
   auto-skipping when the gitignored fixtures or required FFmpeg builds are
   absent.
-- `release-gate.py` — repeatable release-readiness check reporting
-  PASS / FAIL / NOT VERIFIED per gate.
 
 ## [0.6.0]
 

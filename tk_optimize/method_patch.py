@@ -1,6 +1,6 @@
 """Method 3 — encode-patch lineage (CLI name: ``shadow``).
 
-Formula (reverse-engineered, see investigation/encode_patch_video_findings.json):
+Formula (reverse-engineered from observed reference outputs):
 
   input -> ffmpeg-8.0 encode pass:
             video: libx264, preset faster, forced yuv420p (10-bit HDR input
@@ -33,7 +33,6 @@ The encode stage must force ``-pix_fmt yuv420p`` (the reference downsamples
 explicit weightp=2 override makes the bitstream diverge.  The intermediate
 ``-c copy +faststart`` remux re-packs the chunk interleave into the layout the
 reference uses; surgery alone (encode -> patch) does not reproduce it.
-See researchs/ notes for the full derivation.
 """
 
 import os
@@ -44,7 +43,7 @@ from hashlib import sha256
 
 from .branding import load_branding
 from .ffmpeg import FFmpegRunner
-from .method_stream import sha32
+from .method_stream import _stage, _stage_done, _timed, sha32
 from .rebuild import find, make, raw, table_read, table_write, tree
 
 EXPECTED_LAVF_PATCH = "Lavf62.3.100"
@@ -59,11 +58,6 @@ _BANNER = re.compile(rb"(x264 - core \d+) r[0-9a-zA-Z.]+ [0-9a-fA-F]+( - H\.264)
 
 class MethodPatchError(Exception):
     pass
-
-
-def _stage(log, name, detail=None):
-    if log is not None:
-        log.info(f"stage: {name}" + (f": {detail}" if detail else ""))
 
 
 def _collect(boxes, typ, stop_types=()):
@@ -124,7 +118,8 @@ def patch_banner(sample):
     return b"".join(parts), delta_total
 
 
-def surgery(raw_path, out_path, fake_payload):
+def surgery(raw_path, out_path, fake_payload, log=None, verbose=False):
+    dbg = log.dim if (log is not None and verbose) else (lambda _m: None)
     data = open(raw_path, "rb").read()
     tops = tree(data, 0, len(data))
     ftyp = find(tops, "ftyp")
@@ -132,6 +127,8 @@ def surgery(raw_path, out_path, fake_payload):
     mdat = find(tops, "mdat")
     payload_old = mdat.payload_off
     payload = data[payload_old:mdat.end]
+    dbg(f"container read: {len(data) / 1_000_000:.1f} MB, "
+        f"top-level: " + " ".join(f"{b.typ}({b.size})" for b in tops))
 
     traks = [c for c in moov.children if c.typ == "trak"]
     tracks = []
@@ -174,9 +171,11 @@ def surgery(raw_path, out_path, fake_payload):
     span = sum(sum(c[3]) for c in allc)
     if span != len(payload):
         raise MethodPatchError(f"unexpected padding in remux mdat ({span} vs {len(payload)})")
+    dbg(f"chunk walk: {len(allc)} chunks, {len(payload) / 1_000_000:.1f} MB payload, no padding")
 
     # --- rebuild payload (banner-patched video chunks) ---
     out_payload = bytearray()
+    banner_hits, banner_bytes = 0, 0
     for ti, t in enumerate(tracks):
         t["ti"] = ti
     for off, t, s, szs in allc:
@@ -189,6 +188,9 @@ def surgery(raw_path, out_path, fake_payload):
             for z in szs:
                 sample = chunk[pos:pos + z]
                 patched, d = patch_banner(sample)
+                if d:
+                    banner_hits += 1
+                    banner_bytes += d
                 buf += patched
                 new_sizes.append(z - d)
                 pos += z
@@ -196,6 +198,7 @@ def surgery(raw_path, out_path, fake_payload):
         else:
             t.setdefault("chunks", []).append((s, len(out_payload), chunk, szs))
         out_payload += (buf if t["kind"] == "vide" else chunk)
+    dbg(f"SEI banner trim: {banner_hits} patched, {banner_bytes} bytes removed")
 
     # per-track rebuilt tables
     for t in tracks:
@@ -213,6 +216,10 @@ def surgery(raw_path, out_path, fake_payload):
         n_fake = fake_count(n_real)
         t["n_fake"] = n_fake
         t["new_sizes"] = sizes + [FAKE_SIZE] * n_fake
+    for t in tracks:
+        extra = f", + {t['n_fake']} fake size-{FAKE_SIZE} samples" if t["kind"] == "vide" else ""
+        dbg(f"track {t['kind']}: {len(t['new_sizes']) - t.get('n_fake', 0)} real samples "
+            f"({t['real_bytes'] / 1_000_000:.1f} MB), {len(t['new_stco'])} chunks{extra}")
 
     fake_tail_rel = len(out_payload)
     out_payload += fake_payload
@@ -249,6 +256,7 @@ def surgery(raw_path, out_path, fake_payload):
                 mp = data[mdhd_b.payload_off:mdhd_b.end]
                 ts, dur = struct.unpack(">II", mp[12:20])
                 btrt_value = 8 * t["real_bytes"] * ts // dur
+                t["btrt_value"] = btrt_value
                 stco = {"vf": t["tables"]["stco"]["vf"],
                         "offs": [payload_start + o for o in t["new_stco"]]}
                 if t["kind"] == "vide":
@@ -320,6 +328,8 @@ def surgery(raw_path, out_path, fake_payload):
         return bytes(moov_bytes), mdat_size
 
     m1, _ = build(0)
+    for t in tracks:
+        dbg(f"btrt {t['kind']}: {t.get('btrt_value')} bit/s (stsd recomputed)")
     payload_start = ftyp.size + len(FREE8) + 8 + len(m1) + 8
     moov_bytes, mdat_size = build(payload_start)
     moov_box = make("moov", moov_bytes)
@@ -358,27 +368,40 @@ def check_ffmpeg_build(runner, log=None):
 
 def run(input_path, output_path, ffmpeg=None, video_bitrate=DEFAULT_VIDEO_BITRATE,
         audio_bitrate=DEFAULT_AUDIO_BITRATE, fps=DEFAULT_FPS,
-        branding_file=None, log=None):
-    """Execute the full encode-patch method; returns a result dict."""
+        branding_file=None, log=None, verbose=False):
+    """Execute the full encode-patch method; returns a result dict.
+
+    ``log`` receives stage begin/done lines (``stage:`` / ``stage done:``)
+    plus ``verbose`` diagnostics for the Python-side work only; FFmpeg's own
+    output is never forwarded.
+    """
+    logger = log
+    dbg = logger.dim if (logger is not None and verbose) else (lambda _m: None)
     cfg, real_branding = load_branding(branding_file)
     fake_payload = bytes.fromhex(cfg["method_stream"]["fake_payload"])
     if len(fake_payload) != FAKE_SIZE:
         raise MethodPatchError("branding fake_payload must be 8 bytes")
 
-    _stage(log, "hash input")
-    copyright32 = sha32(input_path)
+    with _timed(logger, "hash input", watch_path=input_path):
+        copyright32 = sha32(input_path)
+    dbg(f"copyright tag: {copyright32}")
 
     runner = ffmpeg if isinstance(ffmpeg, FFmpegRunner) else FFmpegRunner(ffmpeg=ffmpeg)
-    ffpath = check_ffmpeg_build(runner, log)
+    ffpath = check_ffmpeg_build(runner, logger)
+    dbg(f"ffmpeg: {ffpath}")
+    dbg(f"ffmpeg version: {runner.version('ffmpeg')}")
 
     tmp_path = output_path + ".encode.tmp.mp4"
-    _stage(log, "encode", f"libx264 @{video_bitrate} r={fps} + AAC @{audio_bitrate}")
     cmd = [ffpath, "-hide_banner", "-loglevel", "error", "-y", "-i", input_path,
            "-c:v", "libx264", "-preset", "faster", "-pix_fmt", "yuv420p",
            "-b:v", video_bitrate, "-threads", "4", "-r", fps,
            "-c:a", "aac", "-b:a", audio_bitrate,
            "-movflags", "+faststart", tmp_path]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    dbg("encode argv: " + " ".join(cmd))
+    with _timed(logger, "encode",
+                f"libx264 @{video_bitrate} r={fps} + AAC @{audio_bitrate} (FFmpeg)",
+                watch_path=tmp_path):
+        proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0 or not os.path.isfile(tmp_path):
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -386,24 +409,32 @@ def run(input_path, output_path, ffmpeg=None, video_bitrate=DEFAULT_VIDEO_BITRAT
 
     remux_path = output_path + ".remux.tmp.mp4"
     try:
-        _stage(log, "remux", "stream copy + faststart (re-packs chunk interleave)")
         cmd = [ffpath, "-hide_banner", "-loglevel", "error", "-y", "-i", tmp_path,
                "-c", "copy", "-movflags", "+faststart", remux_path]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        dbg("remux argv: " + " ".join(cmd))
+        with _timed(logger, "remux",
+                    "stream copy + faststart, re-packs chunk interleave (FFmpeg)",
+                    watch_path=remux_path):
+            proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0 or not os.path.isfile(remux_path):
             raise MethodPatchError(f"ffmpeg remux failed: {proc.stderr.strip()[-400:]}")
 
-        _stage(log, "container patch", "fake samples + metadata surgery")
-        info = surgery(remux_path, output_path, fake_payload)
+        with _timed(logger, "container patch",
+                    "fake samples + metadata surgery", watch_path=output_path):
+            info = surgery(remux_path, output_path, fake_payload,
+                           log=logger, verbose=verbose)
     finally:
         for t in (tmp_path, remux_path):
             if os.path.exists(t):
                 os.remove(t)
 
+    _stage(logger, "hash output")
     h = sha256()
     with open(output_path, "rb") as fh:
         for blk in iter(lambda: fh.read(1 << 20), b""):
             h.update(blk)
+    _stage_done(logger, "hash output", f"{os.path.getsize(output_path) / 1_000_000:.1f} MB")
     info.update({"output": output_path, "sha256": h.hexdigest(),
                  "copyright32": copyright32, "branding": "real" if real_branding else "neutral"})
     return info
+

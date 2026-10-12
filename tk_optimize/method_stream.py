@@ -1,6 +1,6 @@
 """Method 1 — stream-copy lineage (CLI name: ``stealth``).
 
-Formula (reverse-engineered, see investigation docs):
+Formula (reverse-engineered from observed reference outputs):
 
   input -> sha256(input)[:32] as copyright tag
         -> ffmpeg remux: video STREAM COPY (HDR/SEI/rotation preserved),
@@ -14,12 +14,15 @@ Formula (reverse-engineered, see investigation docs):
 
 Deterministic for a given ffmpeg build.  Whole-file byte-identity against
 reference outputs additionally requires an AAC encoder build whose bitstream
-matches (investigation/stream_copy_audio_findings.json).
+matches: a Linux-built FFmpeg 6.1.x reproduces both reference fixtures
+byte-for-byte, while Windows builds differ only in rare AAC bit-allocation
+frames (a compiler/ISA artifact, not a code-version one).
 """
 
 import os
 import struct
 import subprocess
+import time
 from hashlib import sha256
 
 from .branding import load_branding
@@ -43,6 +46,30 @@ def _stage(log, name, detail=None):
         log.info(f"stage: {name}" + (f": {detail}" if detail else ""))
 
 
+def _stage_done(log, name, detail=None):
+    if log is not None:
+        log.info(f"stage done: {name}" + (f": {detail}" if detail else ""))
+
+
+class _timed:
+    """Context manager: emit stage begin/done with wall time and size."""
+
+    def __init__(self, log, name, detail=None, watch_path=None):
+        self.log, self.name, self.detail, self.watch = log, name, detail, watch_path
+
+    def __enter__(self):
+        _stage(self.log, self.name, self.detail)
+        self.t0 = time.monotonic()
+        return self
+
+    def __exit__(self, *exc):
+        parts = [f"{time.monotonic() - self.t0:.1f} s"]
+        if self.watch and os.path.isfile(self.watch):
+            parts.append(f"{os.path.getsize(self.watch) / 1_000_000:.1f} MB")
+        _stage_done(self.log, self.name, ", ".join(parts))
+        return False
+
+
 def sha32(path):
     h = sha256()
     with open(path, "rb") as fh:
@@ -64,39 +91,53 @@ def check_ffmpeg_build(runner, log=None):
 
 
 def run(input_path, output_path, ffmpeg=None, audio_bitrate=DEFAULT_AUDIO_BITRATE,
-        branding_file=None, log=None):
-    """Execute the full stream-copy method; returns a result dict."""
+        branding_file=None, log=None, verbose=False):
+    """Execute the full stream-copy method; returns a result dict.
+
+    ``log`` receives stage begin/done lines (``stage:`` / ``stage done:``)
+    plus ``verbose`` diagnostics for the Python-side work only; FFmpeg's own
+    output is never forwarded.
+    """
+    dbg = log.dim if (log is not None and verbose) else (lambda _m: None)
     cfg, real_branding = load_branding(branding_file)
     ms = cfg["method_stream"]
     fake_payload = bytes.fromhex(ms["fake_payload"])
     if len(fake_payload) != FAKE_SIZE:
         raise MethodStreamError("branding fake_payload must be 8 bytes")
 
-    _stage(log, "hash input")
-    copyright32 = sha32(input_path)
+    with _timed(log, "hash input", watch_path=input_path):
+        copyright32 = sha32(input_path)
+    dbg(f"copyright tag: {copyright32}")
 
     runner = ffmpeg if isinstance(ffmpeg, FFmpegRunner) else FFmpegRunner(ffmpeg=ffmpeg)
     ffpath = check_ffmpeg_build(runner, log)
+    dbg(f"ffmpeg: {ffpath}")
+    dbg(f"ffmpeg version: {runner.version('ffmpeg')}")
 
     udta_entries = [[name, value.replace("{sha32}", copyright32)] for name, value in ms["udta"]]
+    dbg("udta entries: " + ", ".join(name for name, _ in udta_entries))
 
-    _stage(log, "audio encode", f"AAC @{audio_bitrate}")
     audio_path = output_path + ".audio.tmp.m4a"
     cmd = [ffpath, "-hide_banner", "-loglevel", "error", "-y", "-i", input_path,
            "-vn", "-c:a", "aac", "-b:a", audio_bitrate, audio_path]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    dbg("audio argv: " + " ".join(cmd))
+    with _timed(log, "audio encode", f"AAC @{audio_bitrate} (FFmpeg)",
+                watch_path=audio_path):
+        proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0 or not os.path.isfile(audio_path):
         if os.path.exists(audio_path):
             os.remove(audio_path)
         raise MethodStreamError(f"ffmpeg audio encode failed: {proc.stderr.strip()[-400:]}")
 
-    _stage(log, "merge", "video stream copy + audio copy")
     base_path = output_path + ".remux.tmp.mp4"
     cmd = [ffpath, "-hide_banner", "-loglevel", "error", "-y",
            "-i", input_path, "-i", audio_path,
            "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
            "-f", "mp4", base_path]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    dbg("merge argv: " + " ".join(cmd))
+    with _timed(log, "merge", "video stream copy + audio copy (FFmpeg)",
+                watch_path=base_path):
+        proc = subprocess.run(cmd, capture_output=True, text=True)
     os.remove(audio_path)
     if proc.returncode != 0 or not os.path.isfile(base_path):
         if os.path.exists(base_path):
@@ -104,16 +145,23 @@ def run(input_path, output_path, ffmpeg=None, audio_bitrate=DEFAULT_AUDIO_BITRAT
         raise MethodStreamError(f"ffmpeg merge failed: {proc.stderr.strip()[-400:]}")
 
     try:
-        _stage(log, "audio surgery", f"9x fake samples ({FAKE_MULT}N)")
-        info = surgery(base_path, output_path, udta_entries, fake_payload)
+        with _timed(log, "audio surgery",
+                    f"duplicate track + {FAKE_MULT}x fake samples",
+                    watch_path=output_path):
+            info = surgery(base_path, output_path, udta_entries, fake_payload,
+                           log=log, verbose=verbose)
     finally:
         if os.path.exists(base_path):
             os.remove(base_path)
 
+    _stage(log, "hash output")
+    t0 = time.monotonic()
+    out_sha = sha256(open(output_path, "rb").read()).hexdigest()
+    _stage_done(log, "hash output",
+                f"{time.monotonic() - t0:.1f} s, sha256={out_sha}")
     info.update({"copyright32": copyright32, "output": output_path,
-                 "sha256": sha256(open(output_path, "rb").read()).hexdigest(),
+                 "sha256": out_sha,
                  "branding": "real" if real_branding else "neutral"})
-    _stage(log, "done", f"output sha256={info['sha256']}")
     return info
 
 
@@ -329,7 +377,7 @@ def _stsc_entries(chunk_nsamples):
     return ents
 
 
-def surgery(base_path, out_path, udta_entries, fake_payload):
+def surgery(base_path, out_path, udta_entries, fake_payload, log=None, verbose=False):
     """Rebuild the container: custom interleave, audio duplication, fake tail, mdta.
 
     The reference layout is fully re-materialized: chunks are ordered by
@@ -339,6 +387,7 @@ def surgery(base_path, out_path, udta_entries, fake_payload):
     fake payload (9N x 8 bytes) is appended; track 3 stco is intentionally
     not extended for it.
     """
+    dbg = log.dim if (log is not None and verbose) else (lambda _m: None)
     from .rebuild import udta_mdta
     data = open(base_path, "rb").read()
     tops = tree(data, 0, len(data))
@@ -347,6 +396,8 @@ def surgery(base_path, out_path, udta_entries, fake_payload):
     if moov is None or mdat is None:
         raise MethodStreamError("remux output lacks moov/mdat")
     payload_old_off = mdat.payload_off
+    dbg(f"container read: {len(data) / 1_000_000:.1f} MB, "
+        f"top-level: " + " ".join(f"{b.typ}({b.size})" for b in tops))
 
     traks = [c for c in moov.children if c.typ == "trak"]
     kinds = [_handler_of(data, t) for t in traks]
@@ -365,6 +416,8 @@ def surgery(base_path, out_path, udta_entries, fake_payload):
         raise MethodStreamError("unexpected padding in remux mdat")
     n_real = len(asz)
     n_fake = n_real * FAKE_MULT
+    dbg(f"tracks: video {len(vsz)} samples, audio {n_real} samples; "
+        f"dup audio track -> {n_fake} fake size-{FAKE_SIZE} samples")
 
     # --- plan chunk layout (dts merge, video wins ties, audio single) ---
     order = []  # ("V", start_idx, count) / ("A", idx)
@@ -401,6 +454,9 @@ def surgery(base_path, out_path, udta_entries, fake_payload):
     # last; otherwise a trailing video chunk forces the fakes into a new chunk.
     fake_own_chunk = order[-1][0] != "A"
     fake_rel = len(payload) - n_fake * FAKE_SIZE
+    dbg(f"interleave plan: {len(order)} runs, fake_own_chunk={fake_own_chunk}; "
+        f"payload rebuilt {len(payload) / 1_000_000:.1f} MB "
+        f"(incl. {n_fake * FAKE_SIZE} B fake tail)")
 
     stats = {}
 
@@ -499,6 +555,8 @@ def surgery(base_path, out_path, udta_entries, fake_payload):
 
     # two passes: the moov size does not depend on the offsets it stores
     m1 = build(0)
+    dbg(f"audio bitrate track2/track3: {stats.get('bitrate2')}/{stats.get('bitrate3')} bit/s; "
+        f"durations {stats.get('track_dur2')}/{stats.get('track_dur3')} ms")
     payload_start = len(FTYP_TEMPLATE) + len(m1) + len(FREE8) + 8
     moov_new = build(payload_start)
     if len(moov_new) != len(m1):

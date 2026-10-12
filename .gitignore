@@ -14,11 +14,13 @@ tests/fixtures/
 # Local artifacts
 *.log
 .DS_Store
+output/
 
 *.ps1
 
 # Internal-only investigation material (never commit)
 branding.json
+release-gate.py
 investigation/
 reports/
 audits/

@@ -1,6 +1,9 @@
 # Test Report — tk-optimize
 
-Status: **49 passed, 0 failed** on the final revision.
+Status: this report documents the 49-test revision of the H.264/`trace`
+suite. As of 0.7.0 the suite collects **149 tests** — see `README.md`
+(Testing) and the test modules for the CLI, codec/config, and lineage
+byte-identity additions.
 
 ## Environment
 

@@ -2,16 +2,24 @@
 
 [![status](https://img.shields.io/badge/status-stable-blue)](https://img.shields.io)
 [![python](https://img.shields.io/badge/python-3.9%2B-306998?logo=python&logoColor=white)](https://img.shields.io)
-[![tests](https://img.shields.io/badge/tests-134%20passed-2ea44f)](https://img.shields.io)
+[![tests](https://img.shields.io/badge/tests-passing-2ea44f)](https://img.shields.io)
 [![regression](https://img.shields.io/badge/regression-byte--identical-brightgreen)](https://img.shields.io)
 
 A local MP4 optimizer designed to reduce TikTok's aggressive video recompression by transforming the MP4 container structure before upload.
 
 `tk-optimize` preserves the original H.264 video payload and applies a deterministic MP4/container transformation that has been experimentally verified to reproduce the target upload behavior.
 
-For H.264 input, the video is **not re-encoded**. The transformation operates on MP4 sample tables, chunk mappings, offsets, metadata, and container layout while preserving the original picture data.
+For H.264 input, the video is **not re-encoded** in the default (`trace`)
+transformation. It operates on MP4 sample tables, chunk mappings, offsets,
+metadata, and container layout while preserving the original picture data.
+The `stealth` and `shadow` lineages (see below) differ: `stealth` re-encodes
+audio only, and `shadow` runs a single controlled H.264 encode.
 
 HEVC/H.265 input is supported through an optional H.264 preprocessing step using FFmpeg.
+
+Since 0.7.0 the CLI exposes three transformation lineages (`--method`):
+`stealth` (stream-copy), `shadow` (encode-patch), and `trace` (the legacy
+workflow described above). See [Usage](#usage) for details.
 
 > **Important:** `tk-optimize` does not improve the underlying camera footage. It prepares the MP4 for a different upload behavior. The visual result still depends on the source quality and TikTok's current processing pipeline.
 
@@ -311,6 +319,7 @@ invariants are fixed and not exposed. Precedence is:
 | Recommended range (min) | `TK_RECOMMENDED_MIN_BITRATE_MBPS` | —                                              | `15`                   |
 | Recommended range (max) | `TK_RECOMMENDED_MAX_BITRATE_MBPS` | —                                              | `20`                   |
 | Bitrate optimization    | —                                 | `--optimize-bitrate` / `--no-optimize-bitrate` | ask (when above range) |
+| Lineage metadata file   | `TK_BRANDING`                     | —                                              | `branding.json` (untracked) |
 
 ```bash
 TK_OUTPUT_DIR=custom-out python3 tk-cli.py sample.mp4
@@ -327,11 +336,12 @@ rather than being ignored.
 
 ## Installation
 
-Python ≥ 3.9 only. The CLI uses `rich` for colored output
-(`pip install -r requirements.txt`; the library itself has no third-party
-dependencies). `ffmpeg`/`ffprobe` are optional and needed **only** for HEVC
-preprocessing, bitrate analysis, and the delivery bitrate-optimization
-encode (and for the test suite to auto-generate fixtures).
+Python ≥ 3.9 only. The CLI uses `rich` for colored output and `questionary`
+for prompts (`pip install -r requirements.txt`; the library itself has no
+third-party dependencies). `ffmpeg`/`ffprobe` are optional and needed **only**
+for HEVC preprocessing, bitrate analysis, the delivery bitrate-optimization
+encode, and the `stealth`/`shadow` lineages (and for the test suite to
+auto-generate fixtures).
 
 ```bash
 git clone <this-repo> && cd tk-optimize
@@ -390,7 +400,13 @@ The output is written to the output directory (default `output/`, or
 `--verbose` adds `[#]` diagnostic lines: codec, resolution, frame rate,
 timescale, duration, sample/chunk counts, output directory, encode
 settings, the temporary workspace path, and every individual verification
-check. It never dumps raw boxes, sample tables, or full FFmpeg stderr.
+check. For the `stealth`/`shadow` lineages it also reports the pure-Python
+work in detail — FFmpeg argv, container read stats, chunk walks, fake-sample
+counts, recomputed bitrate-box values and metadata patch counters — while
+FFmpeg's own output stays suppressed. Without `--verbose`, interactive
+terminals still see a live spinner per pipeline stage (`stage: NAME …` /
+`stage done: NAME: 15.9 s, 44.4 MB`), so long runs never look stuck.
+`--verbose` never dumps raw boxes, sample tables, or full FFmpeg stderr.
 
 `--dry-run` parses the input, probes the source bitrate, picks the route
 (direct for H.264, HEVC→H.264→MP4 for HEVC, optionally with a delivery
@@ -458,6 +474,22 @@ The library emits semantic `Message` objects (`Logger`) and never depends on
 console libraries; the CLI adds colors via `rich` on top of the same
 `Logger`/`Message` protocol.
 
+The `stealth`/`shadow` lineages are reached through their submodules and
+share the same `Logger` protocol and stage messages:
+
+```python
+from tk_optimize.method_stream import run as stealth_run
+from tk_optimize.method_patch import run as shadow_run
+from tk_optimize.ui import Logger
+
+info = shadow_run("input.mp4", "output.mp4")        # encode-patch lineage
+info = stealth_run("input.mp4", "output.mp4")       # stream-copy lineage
+# info: dict with "output", "sha256", "copyright32" plus per-lineage stats;
+# pass log=Logger(sink=...) and verbose=True for the detailed stage output.
+# Byte identity additionally requires the exact FFmpeg build per lineage
+# (the `ffmpeg=` argument overrides discovery).
+```
+
 ## Video criteria
 
 **Accepted:**
@@ -482,11 +514,16 @@ console libraries; the CLI adds colors via `rich` on top of the same
 
 ```
 tk-optimize/
-├── tk-cli.py              # CLI entry point (argparse, rich presentation)
+├── tk-cli.py              # CLI entry point (argparse, rich, questionary)
 ├── tk_optimize/
 │   ├── boxes.py           # low-level box primitives
 │   ├── parser.py          # codec detection + sample-table extraction
 │   ├── transformer.py     # build_moov / transform_bytes / transform_file
+│   ├── rebuild.py         # ISO-BMFF parse/mutate/re-serialize (lineages)
+│   ├── diffverify.py      # structured binary diff vs a reference output
+│   ├── branding.py        # producer metadata from an untracked file
+│   ├── method_stream.py   # `stealth` lineage (stream-copy)
+│   ├── method_patch.py    # `shadow` lineage (encode-patch)
 │   ├── verifier.py        # structural checks on the output
 │   ├── ffmpeg.py          # FFmpeg/FFprobe discovery + safe runner
 │   ├── preprocess.py      # HEVC -> H.264 + delivery encode (probe + args)
@@ -494,33 +531,54 @@ tk-optimize/
 │   ├── ui.py              # semantic Message/Logger protocol (no rich)
 │   ├── workflow.py        # codec routing, prompts, temp management
 │   └── __init__.py        # public API
-└── tests/
-    ├── conftest.py            # ffmpeg-generated fixtures (H.264/HEVC/…)
-    ├── test_boxes.py          # box primitives
-    ├── test_ffmpeg.py         # discovery + runner behaviour
-    ├── test_preprocess.py     # HEVC -> H.264 + delivery encode
-    ├── test_workflow.py       # codec routing + CLI behaviour
-    ├── test_delivery.py       # bitrate thresholds, routing, UI protocol
-    ├── test_regression.py     # byte-identical vs the reference pair
-    ├── test_structural.py     # generalisation / determinism / safety
-    ├── test_rejection.py      # clean failures
-    └── REPORT.md              # test report
+├── tests/
+│   ├── conftest.py            # ffmpeg-generated fixtures (H.264/HEVC/…)
+│   ├── test_boxes.py          # box primitives
+│   ├── test_cli.py            # CLI behaviour (subprocess, end to end)
+│   ├── test_codecs.py         # codec detection matrix
+│   ├── test_config.py         # env/CLI precedence + validation
+│   ├── test_ffmpeg.py         # discovery + runner behaviour
+│   ├── test_preprocess.py     # HEVC -> H.264 + delivery encode
+│   ├── test_workflow.py       # codec routing + workflow behaviour
+│   ├── test_delivery.py       # bitrate thresholds, routing, UI protocol
+│   ├── test_regression.py     # byte-identical vs the reference pair
+│   ├── test_lineage_regression.py  # byte-identity for stealth/shadow
+│   ├── test_structural.py     # generalisation / determinism / safety
+│   ├── test_rejection.py      # clean failures
+│   └── REPORT.md              # test report
+├── CHANGELOG.md           # version history
+└── releases/              # per-version release notes (e.g. 0.7.0/RELEASE.md)
 ```
 
 ## Testing
 
 ```bash
 cd tk-optimize
-pip install -r requirements.txt   # rich (CLI presentation only)
-pytest -q          # 134 passed (fixtures auto-generated via ffmpeg)
+pip install -r requirements.txt   # rich + questionary (CLI presentation only)
+pytest -q          # 149 tests (fixtures auto-generated via ffmpeg)
 ```
 
 The regression tests (`test_regression.py`) require the reference pair
 (`upload.mp4` / `download.mp4`); they **skip automatically** when the
 fixtures are absent or don't match the reference hashes, so the suite stays
-green on machines without the large inputs. The only byte-for-byte
-comparison in the suite is that pair — new sample files are checked for
-structural correctness and preprocessing behaviour only. See `tests/REPORT.md`.
+green on machines without the large inputs.
+
+The lineage byte-identity tests (`test_lineage_regression.py`) prove
+whole-file SHA-256 equality for the `stealth` and `shadow` methods against
+their reference outputs, plus run-to-run determinism for all three methods.
+They need the large inputs under `samples/` (gitignored) **and** the exact
+FFmpeg build each lineage reproduces:
+
+| Lineage  | Env override        | Required build            |
+| -------- | ------------------- | ------------------------- |
+| `shadow` | `TK_SHADOW_FFMPEG`  | FFmpeg 8.0                |
+| `stealth`| `TK_STEALTH_FFMPEG` | Linux-built FFmpeg 6.1.x  |
+
+When an input or the env var is missing the test **skips** — a skip is never
+reported as a pass. Byte-identity therefore has to be demonstrated on the
+matching host/toolchain; on Windows `stealth` falls short only in rare AAC
+bit-allocation frames, and CI without the samples verifies determinism and
+structure rather than hashes. See `tests/REPORT.md`.
 
 ## Implementation Notes
 
