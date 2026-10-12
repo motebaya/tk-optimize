@@ -11,7 +11,7 @@ venv/
 # Generated test fixtures (recreated by tests/conftest.py with ffmpeg)
 tests/fixtures/
 
-# Local artefacts
+# Local artifacts
 *.log
 .DS_Store
 
@@ -26,6 +26,6 @@ researchs/
 samples/
 tools/
 trash/
-Kuronai-browser-extension/
+browser-extension/
 INVESTIGATION-MANIFEST.md
 
