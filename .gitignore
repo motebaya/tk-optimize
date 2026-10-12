@@ -16,3 +16,16 @@ tests/fixtures/
 .DS_Store
 
 *.ps1
+
+# Internal-only investigation material (never commit)
+branding.json
+investigation/
+reports/
+audits/
+researchs/
+samples/
+tools/
+trash/
+Kuronai-browser-extension/
+INVESTIGATION-MANIFEST.md
+
